@@ -184,20 +184,56 @@ async fn reserve_slot(
     mut on_wait: impl FnMut() -> bool,
 ) -> Option<Slot> {
     let queued = Instant::now();
+    // 【排队日志】请求进入限速队列等待 slot；prefer 提示期望粘键 lane（None=按最闲分配）。
+    tracing::info!(
+        wait_deadline_secs = deadline.saturating_duration_since(queued).as_secs(),
+        prefer_lane = prefer.map(|p| p.to_string()).unwrap_or_else(|| "auto".into()),
+        "排队等待上游 slot",
+    );
     let mut rx = state.dispatch.acquire(deadline, prefer);
+    let mut heartbeat_count: u32 = 0;
     loop {
         tokio::select! {
             slot = &mut rx => {
-                histogram!("nimproxy_queue_wait_seconds").record(queued.elapsed().as_secs_f64());
-                if let Ok(slot) = &slot {
-                    counter!("nimproxy_lane_requests_total", "lane" => slot.lane.to_string())
-                        .increment(1);
+                let waited = queued.elapsed();
+                histogram!("nimproxy_queue_wait_seconds").record(waited.as_secs_f64());
+                match &slot {
+                    Ok(slot) => {
+                        counter!("nimproxy_lane_requests_total", "lane" => slot.lane.to_string())
+                            .increment(1);
+                        // 【获得 slot 日志】终于拿到一个 key 的额度，即将发请求到 NIM。
+                        tracing::info!(
+                            lane = slot.lane,
+                            waited_ms = waited.as_millis() as u64,
+                            "获得 slot，开始请求上游",
+                        );
+                    }
+                    Err(_) => {
+                        // 【超时放弃日志】max_wait 内没等到 slot，放弃这个请求。
+                        tracing::warn!(
+                            waited_ms = waited.as_millis() as u64,
+                            "等待 slot 超时（max_wait 耗尽），放弃请求",
+                        );
+                    }
                 }
                 return slot.ok();
             }
             _ = tokio::time::sleep(heartbeat) => {
                 if !on_wait() {
+                    // 【客户端断连日志】客户端在排队等待期间断开了。
+                    tracing::info!(
+                        waited_ms = queued.elapsed().as_millis() as u64,
+                        "客户端在排队等待期间断开",
+                    );
                     return None;
+                }
+                heartbeat_count += 1;
+                // 【心跳进度日志】每 3 个心跳（约 30s @ heartbeat=10s）打一行让用户知道 proxy 还在等。
+                if heartbeat_count % 3 == 0 {
+                    tracing::info!(
+                        waited_secs = queued.elapsed().as_secs(),
+                        "仍在排队等待上游 slot",
+                    );
                 }
             }
         }
@@ -781,6 +817,8 @@ async fn buffered(
             return gateway_timeout(&cfg, state.pool().len());
         };
         let sent_at = Instant::now();
+        // 【发送日志】非流式请求：已分配到一次 key 额度，向 NIM 发请求。
+        tracing::info!(lane = slot.lane, "已 slot，向 NIM 发送请求");
         // A non-streaming request gets an overall timeout so a stalled body read
         // can't pin an in-flight slot forever (streaming has no such cap).
         let resp = match upstream_request(
@@ -917,6 +955,13 @@ fn streaming(
                 };
 
                 let sent_at = Instant::now();
+                // 【发送日志】已分配到一次 key 额度，向 NIM 发请求。
+                tracing::info!(
+                    lane = slot.lane,
+                    client = %ctx.client,
+                    model = %ctx.model,
+                    "已 slot，向 NIM 发送请求",
+                );
                 let resp = match upstream_request(
                     &state.http,
                     &cfg.base_url,
@@ -983,6 +1028,11 @@ fn streaming(
                         record_request(&ctx, "disconnect");
                         return;
                     }
+                    // 已把请求重新放回限速队列，接下来会等待 bench 时长到期后自动重发。
+                    tracing::info!(
+                        lane = slot.lane,
+                        "已 bench，请求重新进入排队，将在退避到点后自动重发",
+                    );
                     continue;
                 }
 
