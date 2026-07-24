@@ -123,14 +123,53 @@ fn retryable(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
 }
 
-/// Backoff for a benched lane: honor Retry-After when present.
+// ---------- 429 指数退避配置（硬编码，可在此手动调整） ----------
+/// 指数退避基数：撞 429 后首次重试等待 (base × 2^0) 秒。
+const RETRY_BASE_SECS: u64 = 60;
+/// 指数退避倍率：base, base×2, base×4, ...（线性指数，2 即翻倍）。
+const RETRY_EXPONENT: u32 = 2;
+/// 指数退避上限：无论撞过多少次，单次退避不超过此值。
+const RETRY_MAX_SECS: u64 = 600;
+/// 无 Retry-After 头时使用的默认退避（与 base 一致，保持一致语义）。
+const RETRY_DEFAULT_SECS: u64 = RETRY_BASE_SECS;
+/// 窗口对齐安全余量：撞 429 后实际 benched 时长 = max(指数退避值, WINDOW + 此余量)，
+/// 确保 pool 视角 61s 窗口在解禁前一定已滑空，避免解禁即复刻 429。
+const WINDOW_ALIGN_MARGIN: Duration = Duration::from_secs(2);
+/// 非上游限速的瞬时错误（连接错误 / 5xx）使用固定短退避，不进入指数退避计数。
+const CONNECT_BACKOFF: Duration = Duration::from_secs(5);
+
+/// 计算某 lane 的指数退避时长。
+/// `consecutive_429` 是该 lane 连续撞 429 的次数（0 表示首次，应退 60s）。
+fn exponential_backoff(consecutive_429: u32) -> Duration {
+    let n = consecutive_429.min(10); // 防溢出上限（即便万次撞 429 也只升到 cap）
+    // 60s × 2^n（n 从 0 起：首次 60s，二次 120s，三次 240s，四次 480s，五次起封顶 600s）。
+    let exp = RETRY_EXPONENT.saturating_pow(n) as u64;
+    let secs = RETRY_BASE_SECS.saturating_mul(exp);
+    Duration::from_secs(secs.min(RETRY_MAX_SECS))
+}
+
+/// 撞 429 后 lane 的实际 benched 时长：取指数退避值与窗口对齐值中的较大者。
+/// - 上游带 Retry-After 时也走此计算（NIM 实测通常不带，故多数走指数值 60s 起）；
+///   若 Retry-After 更长则采纳 Retry-After（更保守更安全）。
+fn lane_backoff(consecutive_429: u32, retry_after: Option<Duration>) -> Duration {
+    let exp = exponential_backoff(consecutive_429);
+    let align = crate::pool::WINDOW + WINDOW_ALIGN_MARGIN; // ~63s
+    let mut backoff = exp.max(align);
+    if let Some(ra) = retry_after {
+        backoff = backoff.max(ra);
+    }
+    backoff
+}
+
+/// Backoff for a benched lane: honor Retry-After when present (作为下界之一)。
+/// 真正的退避计算在 lane_backoff 中以指数递增实现，这里仅提取 Retry-After。
 fn backoff_for(resp: &reqwest::Response) -> Duration {
     resp.headers()
         .get(header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(10))
+        .unwrap_or(Duration::from_secs(RETRY_DEFAULT_SECS))
 }
 
 /// Join the global FIFO queue for a rate-limit slot, invoking `on_wait` every
@@ -211,6 +250,32 @@ fn bench(slot: &Slot, status: &str, backoff: Duration) {
     counter!("nimproxy_lane_benched_total", "lane" => slot.lane.to_string(), "status" => status.to_owned())
         .increment(1);
     slot.pool.penalize(slot.lane, backoff);
+}
+
+/// 撞 429 后走指数退避 + 窗口对齐的 bench：
+/// - 维护该 NIM key 的连续 429 计数（首次为 0 → 退避 60s）；
+/// - 实际 penalize 时长 = max(指数退避, WINDOW+2s, Retry-After)；
+/// - 5xx / connect 错误不在此处走，仍走 bench(…, “connect”, 5s) 的旧路径。
+fn bench_on_429(state: &AppState, slot: &Slot, retry_after: Option<Duration>) {
+    let count = {
+        let mut m = state.lane_429_count.lock().unwrap();
+        let c = m.entry(slot.key.clone()).or_insert(0);
+        let backoff = lane_backoff(*c, retry_after);
+        *c += 1;
+        backoff
+    };
+    tracing::info!(
+        lane = slot.lane,
+        backoff_secs = count.as_secs(),
+        "lane benched (429 指数退避), retrying"
+    );
+    bench(slot, "429", count);
+}
+
+/// 该 lane 在非 429 路径完成一次成功上游交互后重置 429 计数。
+/// （成功后清零，避免一次偶然 429 把后续都拖到长退避。）
+fn reset_429_count(state: &AppState, key: &str) {
+    state.lane_429_count.lock().unwrap().remove(key);
 }
 
 fn record_request(ctx: &Ctx, status: &str) {
@@ -734,13 +799,13 @@ async fn buffered(
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
-                bench(&slot, "connect", Duration::from_secs(5));
+                bench(&slot, "connect", CONNECT_BACKOFF);
                 continue;
             }
         };
         if retryable(resp.status()) && Instant::now() < deadline {
             let status = resp.status();
-            let backoff = backoff_for(&resp);
+            let retry_after = backoff_for(&resp);
             // Sniff the error body: worker exhaustion is model-scoped (shared
             // across every key), so benching the lane would just burn healthy
             // key capacity on a failover that cannot help.
@@ -751,12 +816,28 @@ async fn buffered(
                     .note_exhausted(&ctx.model, cfg.governor.overrides.get(&ctx.model).copied());
                 continue; // permit drops here; re-admission waits out the drain
             }
-            tracing::info!(lane = slot.lane, %status, ?backoff, "lane benched, retrying");
-            bench(&slot, status.as_str(), backoff);
+            // 429 走指数退避 + 窗口对齐；其他可重试错误（5xx 等）保持 5s 温和退避。
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                // backoff_for 返回的是 Retry-After（无则 RETRY_DEFAULT_SECS=60）。
+                bench_on_429(
+                    &state,
+                    &slot,
+                    if retry_after.as_secs() == RETRY_DEFAULT_SECS {
+                        None
+                    } else {
+                        Some(retry_after)
+                    },
+                );
+            } else {
+                tracing::info!(lane = slot.lane, %status, "lane benched (5xx), retrying");
+                bench(&slot, status.as_str(), CONNECT_BACKOFF);
+            }
             continue;
         }
         histogram!("nimproxy_upstream_seconds", "model" => ctx.model.clone())
             .record(sent_at.elapsed().as_secs_f64());
+        // 成功响应：清零该 key 的连续 429 计数。
+        reset_429_count(&state, &slot.key);
         record_request(&ctx, resp.status().as_str());
         return relay(resp, &ctx).await;
     }
@@ -851,7 +932,7 @@ fn streaming(
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
-                        bench(&slot, "connect", Duration::from_secs(5));
+                        bench(&slot, "connect", CONNECT_BACKOFF);
                         continue;
                     }
                 };
@@ -874,7 +955,7 @@ fn streaming(
                         return;
                     }
                     let status = resp.status();
-                    let backoff = backoff_for(&resp);
+                    let retry_after = backoff_for(&resp);
                     // Worker exhaustion is model-scoped: back off the model via
                     // the governor, never the lane (see `buffered`).
                     let detail = resp.text().await.unwrap_or_default();
@@ -883,9 +964,20 @@ fn streaming(
                             &ctx.model,
                             cfg.governor.overrides.get(&ctx.model).copied(),
                         );
+                    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        // 429 走指数退避 + 窗口对齐；其他 5xx 保持 5s 温和退避。
+                        bench_on_429(
+                            &state,
+                            &slot,
+                            if retry_after.as_secs() == RETRY_DEFAULT_SECS {
+                                None
+                            } else {
+                                Some(retry_after)
+                            },
+                        );
                     } else {
-                        tracing::info!(lane = slot.lane, %status, ?backoff, "lane benched, retrying");
-                        bench(&slot, status.as_str(), backoff);
+                        tracing::info!(lane = slot.lane, %status, "lane benched (5xx), retrying");
+                        bench(&slot, status.as_str(), CONNECT_BACKOFF);
                     }
                     if !send(": retrying\n\n").await {
                         record_request(&ctx, "disconnect");
@@ -991,6 +1083,8 @@ fn streaming(
                 // path (which records upstream_seconds directly).
                 histogram!("nimproxy_upstream_seconds", "model" => ctx.model.clone())
                     .record(sent_at.elapsed().as_secs_f64());
+                // 成功响应：清零该 key 的连续 429 计数。
+                reset_429_count(&state, &slot.key);
                 record_request(&ctx, "200");
                 return;
             }
@@ -1042,7 +1136,21 @@ async fn models(state: Arc<AppState>, cfg: Arc<Config>) -> Response {
         }
         Ok(resp) => {
             if retryable(resp.status()) {
-                bench(&slot, resp.status().as_str(), backoff_for(&resp));
+                let status = resp.status();
+                let retry_after = backoff_for(&resp);
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    bench_on_429(
+                        &state,
+                        &slot,
+                        if retry_after.as_secs() == RETRY_DEFAULT_SECS {
+                            None
+                        } else {
+                            Some(retry_after)
+                        },
+                    );
+                } else {
+                    bench(&slot, status.as_str(), CONNECT_BACKOFF);
+                }
             }
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);

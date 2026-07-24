@@ -104,6 +104,8 @@ pub struct AppState {
     /// Per-model worker-concurrency gate (runtime state, settings in Config).
     pub governor: Arc<governor::Governor>,
     pub history: Arc<history::History>,
+    /// Per-NIM-key 429 连续次数计数，用于指数退避计算 (key 字符串标识 lane，跨 pool 重建保持身份)。
+    pub lane_429_count: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     /// Unix time this process started (dashboard uptime).
     pub started: u64,
 }
@@ -414,6 +416,7 @@ pub async fn run() {
         inflight: AtomicUsize::new(0),
         governor: Arc::new(governor::Governor::default()),
         history: hist,
+        lane_429_count: std::sync::Mutex::new(std::collections::HashMap::new()),
         started: unix_now(),
         store: std::sync::Mutex::new(stored),
         data_dir,

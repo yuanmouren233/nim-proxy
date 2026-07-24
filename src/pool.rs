@@ -30,7 +30,7 @@ pub type PoolHandle = Arc<RwLock<Arc<Pool>>>;
 /// land inside the upstream's window even though it left ours. Load-tested at
 /// 100 concurrent clients: with 60s exactly, ~2% of requests tripped a strict
 /// upstream window; with the pad, zero. Costs ~1.6% peak throughput.
-const WINDOW: Duration = Duration::from_secs(61);
+pub const WINDOW: Duration = Duration::from_secs(61);
 
 /// A lane blueprint. Disabled specs become state carriers: held for their
 /// rate state, never granted.
