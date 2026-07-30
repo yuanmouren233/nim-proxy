@@ -125,11 +125,11 @@ fn retryable(status: reqwest::StatusCode) -> bool {
 
 // ---------- 429 指数退避配置（硬编码，可在此手动调整） ----------
 /// 指数退避基数：撞 429 后首次重试等待 (base × 2^0) 秒。
-const RETRY_BASE_SECS: u64 = 60;
+const RETRY_BASE_SECS: u64 = 301;
 /// 指数退避倍率：base, base×2, base×4, ...（线性指数，2 即翻倍）。
 const RETRY_EXPONENT: u32 = 2;
 /// 指数退避上限：无论撞过多少次，单次退避不超过此值。
-const RETRY_MAX_SECS: u64 = 600;
+const RETRY_MAX_SECS: u64 = 601;
 /// 无 Retry-After 头时使用的默认退避（与 base 一致，保持一致语义）。
 const RETRY_DEFAULT_SECS: u64 = RETRY_BASE_SECS;
 /// 窗口对齐安全余量：撞 429 后实际 benched 时长 = max(指数退避值, WINDOW + 此余量)，
