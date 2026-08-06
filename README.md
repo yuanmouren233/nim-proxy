@@ -130,7 +130,12 @@ header retain the proxy's normal patient behavior.
 
 ## The dashboard
 
-Served at `GET /` — a single embedded HTML file, no Grafana, no config. Because the proxy sits in the request path for every harness and model, it doubles as a **benchmarking and agent-observability tool**: it sees how tool-heavy each harness is, how deep its conversations run, how it tunes sampling, where models truncate, and how much "thinking" a reasoning model burns — all from counts and sizes, never message content.
+Served at `GET /` — a single embedded HTML file with no Grafana or frontend
+build. Because the proxy sits in the request path for every harness and model,
+it doubles as a **benchmarking and agent-observability tool**: it sees how
+tool-heavy each harness is, how deep its conversations run, how it tunes
+sampling, where models truncate, and how much "thinking" a reasoning model
+burns — all from counts and sizes, never message content.
 
 <div align="center"><img src="docs/assets/dashboard-models.png" alt="Models tab" width="850"></div>
 
@@ -139,16 +144,35 @@ Five persona-aligned tabs, each ordered at-a-glance → trends → detail:
 - **Overview** — the one-screen landing: dollars saved, capacity and success-rate ring gauges, request/token/savings sparklines, a health strip, and top models & harnesses.
 - **Models** — ranked model cards, TTFT / generation-speed / inter-token-latency / upstream-latency charts, tokens-per-minute, tool-call volume, truncation and reasoning-share breakdowns, and a head-to-head scorecard.
 - **Clients** — what each agent is *doing*: tool intensity, conversation depth, sampling fingerprint, requested output budget, streaming-vs-buffered mix, and a per-harness leaderboard.
-- **Reliability** — availability against a 99.9% SLO with an error budget, requests-by-outcome over time, where time goes (queue / first token / generation), an error taxonomy, an hour-of-day heatmap, and a model-pressure card when the governor engages.
-- **Capacity** — a saturation bar (load vs aggregate capacity with a peak marker), a provisioning readout that flags when you're a key short, per-lane utilization meters, and 429s-per-minute by lane.
+- **Reliability** — availability against the configured SLO (99.9% by default) with an error budget, requests-by-outcome over time, where time goes (queue / first token / generation), an error taxonomy, an hour-of-day heatmap, and a model-pressure card when the governor engages.
+- **Capacity** — a **Now** saturation bar, historical utilization against the capacity configured at each sample, an exact peak-RPM shortfall, per-lane utilization meters, and 429s-per-minute by lane.
 
 <div align="center"><img src="docs/assets/dashboard-reliability.png" alt="Reliability tab" width="850"></div>
 
 Every line chart has a hover crosshair with a per-series tooltip; every table is click-to-sort and survives the 3-second live refresh.
 
-**Time ranges & history.** The filter row offers Live (pausable) plus 1h/6h/24h/7d/30d presets and a custom calendar range. Range views replay the proxy's own history: a ~4 KB metrics snapshot every 5 minutes, kept for the retention window set in Settings (default 30 days, `0` = forever; ~35 MB per 30 days on the data volume). In a range view every tile, card, and table reports totals *for that window* — instant usage reports.
+**Time ranges & history.** Persisted server history drives every analytical
+tab. The default view follows now across the configured dashboard window
+(30 days by default), so a new server grows naturally from its first sample
+instead of opening on an empty recent slice. The same global selection follows
+you through Overview, Models, Clients, Reliability, and Capacity. Presets
+include 1h/6h/24h/7d/30d and **All retained**; a custom range or the pause
+control freezes the analytical window while current operational values marked
+**Now** keep refreshing. Exact totals do not depend on chart point density.
 
-**Settings.** Everything app-level is managed here, live, with no restart: NIM keys (per-key rpm, enable/disable), client API keys, the open/keyed API mode, upstream URL, limits, pricing, history retention, the model-pressure governor, and users.
+The dashboard window and data retention are separate Server settings. Both
+default to 30 days; retention may be longer than the default view, and `0`
+means unlimited. A finite retention window cannot be shorter than the default
+view. Real history size depends on metric and label cardinality—the old
+fixed-size estimate was wrong—so monitor the displayed history-file size for
+your workload.
+
+**Settings.** Everything app-level is managed here: NIM keys (per-key rpm,
+enable/disable), client API keys, the open/keyed API mode, upstream URL,
+limits, pricing, default dashboard window, history retention, availability
+SLO, the model-pressure governor, and users. Saves validate, persist, and apply
+live. The config file itself is read at boot; an out-of-band edit to
+`DATA_DIR/config.json` requires a restart.
 
 <div align="center"><img src="docs/assets/dashboard-settings.png" alt="Settings: Access & keys" width="850"></div>
 
@@ -165,7 +189,10 @@ Every line chart has a hover crosshair with a per-series tooltip; every table is
 
 ## Configuration
 
-App-level configuration lives in the dashboard (Settings) and persists to `DATA_DIR/config.json`. It applies live — no restarts. Environment variables cover container-level concerns only:
+App-level configuration lives in the dashboard (Settings) and persists to
+`DATA_DIR/config.json`. Settings saves apply live; the file is otherwise read
+at boot, so manual or automated out-of-band edits require a restart.
+Environment variables cover container-level concerns only:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -174,7 +201,17 @@ App-level configuration lives in the dashboard (Settings) and persists to `DATA_
 | `TRUST_PROXY` | `false` | Trust `X-Forwarded-Proto` and mark the session cookie `Secure` (set behind a TLS-terminating reverse proxy) |
 | `RUST_LOG` | `nim_proxy=info` | Log filter |
 
-Everything else is a Settings control: NIM keys (per-key rpm, enable/disable, ownership), the upstream base URL, client API keys and the open/keyed API mode, limits (`max_wait`, `heartbeat`, `stream_idle`, `request_timeout`, `models_ttl`, `max_inflight`, `strict_passthrough`), reference pricing, history retention, the model-pressure governor, and users & roles.
+Docker Compose also reads `PUBLISH_HOST` from `.env` for the host-side port
+publish. It defaults to `127.0.0.1`; set `PUBLISH_HOST=0.0.0.0` only when the
+deployment is ready for LAN/public reachability. This is a Compose setting,
+not an environment variable consumed by nim-proxy.
+
+Everything else is a Settings control: NIM keys (per-key rpm, enable/disable,
+ownership), the upstream base URL, client API keys and the open/keyed API
+mode, limits (`max_wait`, `heartbeat`, `stream_idle`, `request_timeout`,
+`models_ttl`, `max_inflight`, `strict_passthrough`), reference pricing,
+default dashboard window, history retention, availability SLO, the
+model-pressure governor, and users & roles.
 
 ## Security & deployment
 
@@ -197,7 +234,9 @@ Login is username + password → a signed, HttpOnly, SameSite=Strict session coo
 - **`keyed`** (default) — clients send `Authorization: Bearer <npk_…>`. Each user mints their own client keys; a key's 128-bit secret is shown **exactly once** (only its SHA-256 digest + last-4 are stored). Keyed with zero keys rejects everything (fail closed). Unknown keys get an OpenAI-style 401; comparison is constant-time.
 - **`open`** — `/v1` is unauthenticated. Only for loopback or a fully private network. This toggle affects **only `/v1`** — the dashboard is never open.
 
-The compose file publishes `127.0.0.1:8000:8000` by default so a bare bring-up can't leak.
+The compose file publishes `127.0.0.1:8000:8000` by default so a bare
+bring-up can't leak. Set `PUBLISH_HOST=0.0.0.0` in `.env` when intentional
+LAN/public exposure is protected appropriately.
 
 ### Scrapers
 
@@ -224,7 +263,7 @@ scrape_configs:
 
 ### Supply chain
 
-The build and release path is hardened to the OpenSSF baseline (scored weekly by the [Scorecard badge](https://scorecard.dev/viewer/?uri=github.com/miztertea/nim-proxy) above): every GitHub Actions step is SHA-pinned, CI runs **CodeQL** static analysis, workflow linting (`actionlint` + `zizmor`), dependency review, and `cargo-deny` (advisories on every PR plus a weekly audit), and the untrusted-byte parsers are **fuzzed** weekly. Releases are signed with keyless [cosign](https://docs.sigstore.dev/): the multi-arch image carries a signature, SLSA build provenance, and an SPDX SBOM, and the downloadable tarballs + SBOM each ship a `.sig` + `.pem` you can check with `cosign verify-blob` (the exact command is in every release's notes). Published `v*` tags are protected against retagging.
+The build and release path is hardened to the OpenSSF baseline (scored weekly by the [Scorecard badge](https://scorecard.dev/viewer/?uri=github.com/miztertea/nim-proxy) above): every GitHub Actions step is SHA-pinned, CI runs **CodeQL** static analysis, workflow linting (`actionlint` + `zizmor`), dependency review, and `cargo-deny` (advisories on every PR plus a weekly audit), and the untrusted-byte parsers are **fuzzed** weekly. Releases are signed with keyless [cosign](https://docs.sigstore.dev/): the multi-arch image carries a signature, SLSA build provenance, and an SPDX SBOM, and the downloadable tarballs + SBOM each ship a `.sigstore.json` bundle you can check with `cosign verify-blob` (the exact command is in every release's notes). Published `v*` tags are protected against retagging.
 
 ## Operations
 
@@ -299,7 +338,10 @@ It exits non-zero on any client-visible failure or a single upstream rate violat
 - **Non-streaming requests can't be heartbeated** (no wire format for it) — they wait silently through pacing/retries up to the `max_wait` limit. Agent harnesses stream, so this rarely matters.
 - **One instance per key set.** Rate state is in-memory; two replicas sharing keys would each assume the full 40 RPM. Run one instance (it comfortably saturates far more keys than you can register).
 - **Rate windows reset on restart.** A restart right after heavy traffic can draw a burst of 429s — the retry machinery absorbs them invisibly.
-- **Chart history in a Live view lives in the browser** (~20 min); range views and totals come from server-side history and survive refresh.
+- **Dashboard history is sample-precise, not event-precise.** Following,
+  fixed, and All-retained views can all be rebuilt from server history after
+  refresh/restart, though the UI selection itself resets to the default.
+  Only adjacent-poll **Now** rates need two current samples.
 - **"OTel metrics?"** Prometheus exposition format, which every OpenTelemetry collector ingests natively (`prometheus` receiver).
 - **No built-in TLS.** Terminate TLS at a reverse proxy or platform edge for any exposed deployment; set `TRUST_PROXY=true` so session cookies are marked `Secure`.
 - **Sessions reset on restart.** The cookie signing key is random per boot, so a restart logs everyone out of the dashboard (API keys are unaffected).

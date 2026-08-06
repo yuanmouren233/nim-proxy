@@ -1,7 +1,7 @@
 ---
 type: Runbook
 title: Configuration reference
-description: The 5 container-level env vars; everything else lives in the Settings UI; lockout recovery.
+description: Compose publishing, the 5 container-level env vars, Settings, and lockout recovery.
 tags: [configuration]
 timestamp: 2026-07-04T00:00:00Z
 ---
@@ -13,7 +13,16 @@ A first-run wizard claims a fresh install (create the superuser → add ≥1 NIM
 key, validated against the upstream → land on the dashboard, logged in); after
 that, Settings edits everything and persists it to `DATA_DIR/config.json`
 (atomic, 0600 — see [ui-managed-config-store](../decisions/ui-managed-config-store.md)).
-Env now covers **container-level concerns only**.
+Env now covers **deployment-level concerns only**.
+
+## Compose-only publish setting
+
+`PUBLISH_HOST` controls the host interface where Docker Compose publishes
+container port 8000. It defaults to `127.0.0.1`, keeping a bare deployment
+loopback-only. Set `PUBLISH_HOST=0.0.0.0` in `.env` only for intentional
+LAN/public exposure after the authentication and TLS posture is ready.
+Compose consumes this value while interpolating `docker-compose.yml`;
+nim-proxy itself does not read it.
 
 ## The 5 env vars
 
@@ -33,9 +42,24 @@ the contract.)
 NIM keys (per-key rpm, enable/disable, ownership), the upstream base URL,
 client API keys and the open/keyed API mode, limits (max_wait, heartbeat,
 stream_idle, request_timeout, models_ttl, max_inflight, strict_passthrough),
-pricing, history retention days, the model-pressure governor, and users/roles
-all live in the store and are edited from the dashboard. All apply live — no
-restart.
+pricing, the default dashboard window, history retention days, the
+availability SLO, the model-pressure governor, and users/roles all live in the
+store and are edited from the dashboard. A Settings save validates the
+complete candidate, writes `config.json` atomically, and swaps the live
+configuration; no restart is needed.
+
+The file is otherwise **boot-read**, not watched. An out-of-band edit to
+`DATA_DIR/config.json`—by an operator, deployment tool, or mounted secret
+writer—does not update the running process and requires a restart. Use the
+Settings API for live changes.
+
+The default dashboard window and retention are separate settings and both
+default to 30 days. The default window must be at least one day. Retention `0`
+is unlimited; finite retention must be at least the default window. The SLO
+must be a finite percentage greater than 0 and at most 100. A combined save is
+all-or-nothing: any invalid field leaves the persisted and live configuration
+unchanged. Reducing retention trims the visible index immediately and
+schedules atomic background compaction of `history.jsonl`.
 
 **Legacy env vars are ignored.** `NIM_API_KEYS`, `PROXY_API_KEYS`,
 `ADMIN_PASSWORD`, `INSECURE_NO_AUTH`, `NIM_BASE_URL`, `RPM_PER_KEY`,

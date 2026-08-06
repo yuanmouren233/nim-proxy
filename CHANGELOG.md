@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-07-28
+
+### Fixed
+
+- Persisted dashboard traffic now appears immediately after login and remains
+  truthful across process/container restarts. Startup indexing normalizes
+  explicit v2 process epochs and legacy v1 counter resets; chart point limits
+  no longer change reported totals.
+- The existing dashboard time controls now apply one selected window across
+  Overview, Models, Clients, Reliability, and Capacity. The default follows
+  the retained 30-day window, fixed/paused ranges stay fixed, and **All
+  retained** reaches the earliest available sample.
+- Historical Capacity views now use the configuration recorded with each
+  sample instead of comparing past traffic with today's pool. Unavailable
+  pre-history time is no longer treated as observed capacity.
+
+### Security
+
+- Moved release metadata and image digests from inline shell-template
+  expansions into step-scoped environment variables, and added a seven-day
+  observation window for routine Cargo, GitHub Actions, and Docker dependency
+  updates. Dependabot security updates remain immediate.
+- Replaced the third-party GitHub Release publishing action with the
+  GitHub-hosted runner's preinstalled `gh` CLI, preserving generated notes,
+  verification instructions, and signed asset uploads while reducing the
+  workflow's external action surface.
+
+### Changed
+
+- Docker Compose's host-side publish address is now configurable with
+  `PUBLISH_HOST` in `.env` while retaining `127.0.0.1` as the safe default.
+- Replaced browser parsing of raw `/metrics`, `/api/history`, and
+  `/dash/config.json` data with authenticated typed range/current dashboard
+  contracts, revision-aware live tails, and server-side exact rollups.
+- Default dashboard window, data retention, and availability target are
+  separate Server settings rather than hardcoded display assumptions. Window
+  and retention default to 30 days; retention `0` is unlimited and finite
+  retention cannot be shorter than the default view.
+- Current lane/load values use the live **Now** snapshot while selected-window
+  values stay historical.
+- History retention now trims the in-memory index immediately and compacts the
+  JSONL file atomically in the background while preserving the boundary
+  baseline and boot marker needed for exact retained totals. The old
+  fixed-size estimate was removed after a real 7,316-sample history measured
+  235,598,655 bytes; size remains workload-dependent.
+
 ## [0.6.4] - 2026-07-17
 
 ### Added
@@ -30,9 +76,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Refreshed runtime and supply-chain dependencies: Tokio 1.53.0, bytes 1.12.1,
-  the pinned Rust builder image, eight pinned GitHub Actions, and
-  `sigstore/cosign-installer` 4.1.2.
+- Refreshed runtime and supply-chain dependencies: Tokio 1.53.1, bytes 1.12.1,
+  serde 1.0.229, serde_json 1.0.151, futures-util 0.3.33, tokio-stream 0.1.19,
+  the pinned Rust builder image and toolchain action, pinned GitHub Actions,
+  and `sigstore/cosign-installer` 4.1.2.
+- Migrated downloadable-asset signing to Cosign v3 Sigstore bundles, pinned
+  the Cosign CLI independently of its installer action, and added a real
+  sign/verify contract smoke test to CI.
 - Internal cleanup (no behavior change): dropped a redundant `async` on the
   streaming handler (all `.await`s live inside its spawned task, so the
   function itself never awaited — this avoids wrapping it in a needless
@@ -458,7 +508,8 @@ Initial rate-limit-aware proxy.
 - **Distroless image**: a static musl binary shipped `FROM scratch` (~3.5 MB,
   TLS roots compiled in), running non-root with hardened compose defaults.
 
-[Unreleased]: https://github.com/miztertea/nim-proxy/compare/v0.6.4...HEAD
+[Unreleased]: https://github.com/miztertea/nim-proxy/compare/v0.6.5...HEAD
+[0.6.5]: https://github.com/miztertea/nim-proxy/compare/v0.6.4...v0.6.5
 [0.6.4]: https://github.com/miztertea/nim-proxy/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/miztertea/nim-proxy/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/miztertea/nim-proxy/compare/v0.6.1...v0.6.2
